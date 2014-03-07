@@ -65,10 +65,6 @@ struct pfkey_sock {
 	} dump;
 };
 
-static int parse_sockaddr_pair(struct sockaddr *sa, int ext_len,
-			       xfrm_address_t *saddr, xfrm_address_t *daddr,
-			       u16 *family);
-
 static inline struct pfkey_sock *pfkey_sk(struct sock *sk)
 {
 	return (struct pfkey_sock *)sk;
@@ -1914,14 +1910,19 @@ parse_ipsecrequest(struct xfrm_policy *xp, struct sadb_x_ipsecrequest *rq)
 
 	/* addresses present only in tunnel mode */
 	if (t->mode == XFRM_MODE_TUNNEL) {
-		int err;
+		u8 *sa = (u8 *) (rq + 1);
+		int family, socklen;
 
-		err = parse_sockaddr_pair(
-			(struct sockaddr *)(rq + 1),
-			rq->sadb_x_ipsecrequest_len - sizeof(*rq),
-			&t->saddr, &t->id.daddr, &t->encap_family);
-		if (err)
-			return err;
+		family = pfkey_sockaddr_extract((struct sockaddr *)sa,
+						&t->saddr);
+		if (!family)
+			return -EINVAL;
+
+		socklen = pfkey_sockaddr_len(family);
+		if (pfkey_sockaddr_extract((struct sockaddr *)(sa + socklen),
+					   &t->id.daddr) != family)
+			return -EINVAL;
+		t->encap_family = family;
 	} else
 		t->encap_family = xp->family;
 
@@ -1941,11 +1942,7 @@ parse_ipsecrequests(struct xfrm_policy *xp, struct sadb_x_policy *pol)
 	if (pol->sadb_x_policy_len * 8 < sizeof(struct sadb_x_policy))
 		return -EINVAL;
 
-	while (len >= sizeof(*rq)) {
-		if (len < rq->sadb_x_ipsecrequest_len ||
-		    rq->sadb_x_ipsecrequest_len < sizeof(*rq))
-			return -EINVAL;
-
+	while (len >= sizeof(struct sadb_x_ipsecrequest)) {
 		if ((err = parse_ipsecrequest(xp, rq)) < 0)
 			return err;
 		len -= rq->sadb_x_ipsecrequest_len;
@@ -2251,7 +2248,7 @@ static int pfkey_spdadd(struct sock *sk, struct sk_buff *skb, const struct sadb_
 			goto out;
 		}
 
-		err = security_xfrm_policy_alloc(&xp->security, uctx, GFP_KERNEL);
+		err = security_xfrm_policy_alloc(&xp->security, uctx);
 		kfree(uctx);
 
 		if (err)
@@ -2353,7 +2350,7 @@ static int pfkey_spddelete(struct sock *sk, struct sk_buff *skb, const struct sa
 		if (!uctx)
 			return -ENOMEM;
 
-		err = security_xfrm_policy_alloc(&pol_ctx, uctx, GFP_KERNEL);
+		err = security_xfrm_policy_alloc(&pol_ctx, uctx);
 		kfree(uctx);
 		if (err)
 			return err;
@@ -2416,6 +2413,7 @@ out:
 	return err;
 }
 
+#ifdef CONFIG_NET_KEY_MIGRATE
 static int pfkey_sockaddr_pair_size(sa_family_t family)
 {
 	return PFKEY_ALIGN8(pfkey_sockaddr_len(family) * 2);
@@ -2427,7 +2425,7 @@ static int parse_sockaddr_pair(struct sockaddr *sa, int ext_len,
 {
 	int af, socklen;
 
-	if (ext_len < 2 || ext_len < pfkey_sockaddr_pair_size(sa->sa_family))
+	if (ext_len < pfkey_sockaddr_pair_size(sa->sa_family))
 		return -EINVAL;
 
 	af = pfkey_sockaddr_extract(sa, saddr);
@@ -2443,7 +2441,6 @@ static int parse_sockaddr_pair(struct sockaddr *sa, int ext_len,
 	return 0;
 }
 
-#ifdef CONFIG_NET_KEY_MIGRATE
 static int ipsecrequests_to_migrate(struct sadb_x_ipsecrequest *rq1, int len,
 				    struct xfrm_migrate *m)
 {
@@ -2451,14 +2448,13 @@ static int ipsecrequests_to_migrate(struct sadb_x_ipsecrequest *rq1, int len,
 	struct sadb_x_ipsecrequest *rq2;
 	int mode;
 
-	if (len < sizeof(*rq1) ||
-	    len < rq1->sadb_x_ipsecrequest_len ||
-	    rq1->sadb_x_ipsecrequest_len < sizeof(*rq1))
+	if (len <= sizeof(struct sadb_x_ipsecrequest) ||
+	    len < rq1->sadb_x_ipsecrequest_len)
 		return -EINVAL;
 
 	/* old endoints */
 	err = parse_sockaddr_pair((struct sockaddr *)(rq1 + 1),
-				  rq1->sadb_x_ipsecrequest_len - sizeof(*rq1),
+				  rq1->sadb_x_ipsecrequest_len,
 				  &m->old_saddr, &m->old_daddr,
 				  &m->old_family);
 	if (err)
@@ -2467,14 +2463,13 @@ static int ipsecrequests_to_migrate(struct sadb_x_ipsecrequest *rq1, int len,
 	rq2 = (struct sadb_x_ipsecrequest *)((u8 *)rq1 + rq1->sadb_x_ipsecrequest_len);
 	len -= rq1->sadb_x_ipsecrequest_len;
 
-	if (len <= sizeof(*rq2) ||
-	    len < rq2->sadb_x_ipsecrequest_len ||
-	    rq2->sadb_x_ipsecrequest_len < sizeof(*rq2))
+	if (len <= sizeof(struct sadb_x_ipsecrequest) ||
+	    len < rq2->sadb_x_ipsecrequest_len)
 		return -EINVAL;
 
 	/* new endpoints */
 	err = parse_sockaddr_pair((struct sockaddr *)(rq2 + 1),
-				  rq2->sadb_x_ipsecrequest_len - sizeof(*rq2),
+				  rq2->sadb_x_ipsecrequest_len,
 				  &m->new_saddr, &m->new_daddr,
 				  &m->new_family);
 	if (err)
@@ -3252,7 +3247,7 @@ static struct xfrm_policy *pfkey_compile_policy(struct sock *sk, int opt,
 		if ((*dir = verify_sec_ctx_len(p)))
 			goto out;
 		uctx = pfkey_sadb2xfrm_user_sec_ctx(sec_ctx, GFP_ATOMIC);
-		*dir = security_xfrm_policy_alloc(&xp->security, uctx, GFP_ATOMIC);
+		*dir = security_xfrm_policy_alloc(&xp->security, uctx);
 		kfree(uctx);
 
 		if (*dir)
