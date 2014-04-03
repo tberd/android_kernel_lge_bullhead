@@ -253,19 +253,14 @@ static inline struct page *page_cache_alloc_readahead(struct address_space *x)
 typedef int filler_t(void *, struct page *);
 
 pgoff_t page_cache_next_hole(struct address_space *mapping,
+			     pgoff_t index, unsigned long max_scan);
+pgoff_t page_cache_prev_hole(struct address_space *mapping,
+			     pgoff_t index, unsigned long max_scan);
+
+extern struct page * find_get_page(struct address_space *mapping,
+				pgoff_t index);
+pgoff_t page_cache_next_hole(struct address_space *mapping,
                              pgoff_t index, unsigned long max_scan);
-
-extern struct page * find_get_page_flags(struct address_space *mapping,
-					 pgoff_t index, int fgp_flags);
-
-#define FGP_ACCESSED		0x00000001
-
-static inline struct page* find_get_page(struct address_space *mapping,
-					 pgoff_t index)
-{
-	return find_get_page_flags(mapping, index, 0);
-}
-
 
 extern struct page * find_lock_page(struct address_space *mapping,
 				pgoff_t index);
@@ -275,16 +270,8 @@ unsigned find_get_pages(struct address_space *mapping, pgoff_t start,
 			unsigned int nr_pages, struct page **pages);
 unsigned find_get_pages_contig(struct address_space *mapping, pgoff_t start,
 			       unsigned int nr_pages, struct page **pages);
-unsigned find_get_pages_range_tag(struct address_space *mapping, pgoff_t *index,
-			pgoff_t end, int tag, unsigned int nr_pages,
-			struct page **pages);
-static inline unsigned find_get_pages_tag(struct address_space *mapping,
-			pgoff_t *index, int tag, unsigned int nr_pages,
-			struct page **pages)
-{
-	return find_get_pages_range_tag(mapping, index, (pgoff_t)-1, tag,
-					nr_pages, pages);
-}
+unsigned find_get_pages_tag(struct address_space *mapping, pgoff_t *index,
+			int tag, unsigned int nr_pages, struct page **pages);
 
 struct page *grab_cache_page_write_begin(struct address_space *mapping,
 			pgoff_t index, unsigned flags);
