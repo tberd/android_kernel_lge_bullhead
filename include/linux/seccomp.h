@@ -27,7 +27,6 @@ struct seccomp {
 	struct seccomp_filter *filter;
 };
 
-#ifdef CONFIG_HAVE_ARCH_SECCOMP_FILTER
 extern int __secure_computing(void);
 static inline int secure_computing(void)
 {
@@ -35,9 +34,18 @@ static inline int secure_computing(void)
 		return  __secure_computing();
 	return 0;
 }
-#else
-extern void secure_computing_strict(int this_syscall);
-#endif
+
+#define SECCOMP_PHASE1_OK	0
+#define SECCOMP_PHASE1_SKIP	1
+
+extern u32 seccomp_phase1(struct seccomp_data *sd);
+int seccomp_phase2(u32 phase1_result);
+
+/* A wrapper for architectures supporting only SECCOMP_MODE_STRICT. */
+static inline void secure_computing_strict(int this_syscall)
+{
+	BUG_ON(secure_computing(this_syscall) != 0);
+}
 
 extern long prctl_get_seccomp(void);
 extern long prctl_set_seccomp(unsigned long, char __user *);
@@ -54,11 +62,8 @@ static inline int seccomp_mode(struct seccomp *s)
 struct seccomp { };
 struct seccomp_filter { };
 
-#ifdef CONFIG_HAVE_ARCH_SECCOMP_FILTER
-static inline int secure_computing(void) { return 0; }
-#else
+static inline int secure_computing(int this_syscall) { return 0; }
 static inline void secure_computing_strict(int this_syscall) { return; }
-#endif
 
 static inline long prctl_get_seccomp(void)
 {
