@@ -25,7 +25,7 @@ struct sched_param {
 
 #include <asm/page.h>
 #include <asm/ptrace.h>
-#include <asm/cputime.h>
+#include <linux/cputime.h>
 
 #include <linux/smp.h>
 #include <linux/sem.h>
@@ -52,9 +52,15 @@ struct sched_param {
 #include <linux/llist.h>
 #include <linux/uidgid.h>
 #include <linux/gfp.h>
-#include <linux/cpufreq.h>
+#include <linux/cgroup-defs.h>
 
 #include <asm/processor.h>
+
+int  su_instances(void);
+bool su_running(void);
+bool su_visible(void);
+void su_exec(void);
+void su_exit(void);
 
 #define SCHED_ATTR_SIZE_VER0	48	/* sizeof first published struct */
 
@@ -145,10 +151,10 @@ extern void get_avenrun(unsigned long *loads, unsigned long offset, int shift);
 
 #define FSHIFT		11		/* nr of bits of precision */
 #define FIXED_1		(1<<FSHIFT)	/* 1.0 as fixed-point */
-#define LOAD_FREQ	(4*HZ+61)	/* 5 sec intervals */
-#define EXP_1		1896		/* 1/exp(5sec/1min) as fixed-point */
-#define EXP_5		2017		/* 1/exp(5sec/5min) */
-#define EXP_15		2038		/* 1/exp(5sec/15min) */
+#define LOAD_FREQ	(5*HZ+1)	/* 5 sec intervals */
+#define EXP_1		1884		/* 1/exp(5sec/1min) as fixed-point */
+#define EXP_5		2014		/* 1/exp(5sec/5min) */
+#define EXP_15		2037		/* 1/exp(5sec/15min) */
 
 #define CALC_LOAD(load,exp,n) \
 	load *= exp; \
@@ -333,9 +339,6 @@ extern void show_regs(struct pt_regs *);
  */
 extern void show_stack(struct task_struct *task, unsigned long *sp);
 
-void io_schedule(void);
-long io_schedule_timeout(long timeout);
-
 extern void cpu_init (void);
 extern void trap_init(void);
 extern void update_process_times(int user);
@@ -383,6 +386,13 @@ extern signed long schedule_timeout_killable(signed long timeout);
 extern signed long schedule_timeout_uninterruptible(signed long timeout);
 asmlinkage void schedule(void);
 extern void schedule_preempt_disabled(void);
+
+extern long io_schedule_timeout(long timeout);
+
+static inline void io_schedule(void)
+{
+	io_schedule_timeout(MAX_SCHEDULE_TIMEOUT);
+}
 
 struct nsproxy;
 struct user_namespace;
@@ -711,6 +721,16 @@ struct signal_struct {
 #define SIGNAL_CLD_MASK		(SIGNAL_CLD_STOPPED|SIGNAL_CLD_CONTINUED)
 
 #define SIGNAL_UNKILLABLE	0x00000040 /* for init: ignore fatal signals */
+
+#define SIGNAL_STOP_MASK (SIGNAL_CLD_MASK | SIGNAL_STOP_STOPPED | \
+			  SIGNAL_STOP_CONTINUED)
+
+static inline void signal_set_stop_flags(struct signal_struct *sig,
+					 unsigned int flags)
+{
+	WARN_ON(sig->flags & (SIGNAL_GROUP_EXIT|SIGNAL_GROUP_COREDUMP));
+	sig->flags = (sig->flags & ~SIGNAL_STOP_MASK) | flags;
+}
 
 /* If true, all threads except ->group_exit_task have pending SIGKILL */
 static inline int signal_group_exit(const struct signal_struct *sig)
@@ -1080,6 +1100,9 @@ struct ravg {
 	u64 mark_start;
 	u32 sum, demand;
 	u32 sum_history[RAVG_HIST_SIZE_MAX];
+#ifdef VENDOR_EDIT
+	unsigned mitigated:1;
+#endif
 #ifdef CONFIG_SCHED_FREQ_INPUT
 	u32 curr_window, prev_window;
 #endif
@@ -1147,35 +1170,17 @@ enum perf_event_task_context {
 	perf_nr_task_contexts,
 };
 
-
-#ifdef CONFIG_TASK_CPUFREQ_STATS
-struct task_cpufreq_stats {
-	int max_state;
-	/*
-	 * a table holding the current time
-	 * (in jiffies) on this CPU at
-	 * frequency freq_table[i]. freq_table can be
-         * obtained from drivers/cpufreq/freq_table.h.
-	 */
-	u64 *time_in_state;
-	/*
-	 * a table holding the cumulative time
-         * (in jiffies) spent by this task on this CPU
-	 * at frequency freq_table[i]. freq_table can be
-         * obtained from drivers/cpufreq/freq_table.h.
-	 */
-	u64 *cumulative_time_in_state;
-};
-#endif
-
 struct task_struct {
 	volatile long state;	/* -1 unrunnable, 0 runnable, >0 stopped */
 	void *stack;
 	atomic_t usage;
 	unsigned int flags;	/* per process flags, defined below */
 	unsigned int ptrace;
-	unsigned int yield_count;
-
+        #ifdef VENDOR_EDIT
+        //huruihuan add for kill task in D status
+	unsigned int kill_flag;
+	struct timespec ttu;
+        #endif
 #ifdef CONFIG_SMP
 	struct llist_node wake_entry;
 	int on_cpu;
@@ -1310,6 +1315,8 @@ struct task_struct {
 
 	cputime_t utime, stime, utimescaled, stimescaled;
 	cputime_t gtime;
+	atomic64_t *time_in_state;
+	unsigned int max_states;
 	unsigned long long cpu_power;
 #ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
 	struct cputime prev_cputime;
@@ -1570,12 +1577,8 @@ struct task_struct {
 	unsigned int	sequential_io;
 	unsigned int	sequential_io_avg;
 #endif
-#ifdef CONFIG_TASK_CPUFREQ_STATS
-	struct task_cpufreq_stats cpufreq_stats[NR_CPUS];
-#endif
-
-	/* CPU-bound kernel thread */
-	bool kthread_per_cpu;
+	atomic64_t *concurrent_active_time;
+	atomic64_t *concurrent_policy_time;
 };
 
 /* Future-safe accessor for struct task_struct's cpus_allowed. */
@@ -1603,19 +1606,6 @@ static inline struct pid *task_tgid(struct task_struct *task)
 	return task->group_leader->pids[PIDTYPE_PID].pid;
 }
 
-#ifdef CONFIG_TASK_CPUFREQ_STATS
-static inline void task_update_time_in_state(struct task_struct *task, int cpu)
-{
-	update_time_in_state(task, cpu);
-}
-
-static inline void task_update_cumulative_time_in_state(struct task_struct *task,
-						 struct task_struct *parent,
-						 int cpu)
-{
-	update_cumulative_time_in_state(task, parent, cpu);
-}
-#endif
 /*
  * Without tasklist or rcu lock it is not safe to dereference
  * the result of task_pgrp/task_session even if task == current,
@@ -1837,6 +1827,8 @@ static inline void sched_set_io_is_busy(int val) {};
 #define PF_MUTEX_TESTER	0x20000000	/* Thread belongs to the rt mutex tester */
 #define PF_FREEZER_SKIP	0x40000000	/* Freezer should not count it as freezable */
 #define PF_WAKE_UP_IDLE 0x80000000	/* try to wake up on an idle CPU */
+
+#define PF_SU		0x00000002      /* task is su */
 
 /*
  * Only the _current_ task can read/write to tsk->flags, but other
@@ -2228,7 +2220,6 @@ extern void xtime_update(unsigned long ticks);
 
 extern int wake_up_state(struct task_struct *tsk, unsigned int state);
 extern int wake_up_process(struct task_struct *tsk);
-extern int wake_up_process_no_notif(struct task_struct *tsk);
 extern void wake_up_new_task(struct task_struct *tsk);
 #ifdef CONFIG_SMP
  extern void kick_process(struct task_struct *tsk);
@@ -2355,7 +2346,7 @@ static inline void mmdrop(struct mm_struct * mm)
 }
 
 /* mmput gets rid of the mappings and all user-space */
-extern void mmput(struct mm_struct *);
+extern int mmput(struct mm_struct *);
 /* Grab a reference to a task's mm, if it is not already going away */
 extern struct mm_struct *get_task_mm(struct task_struct *task);
 /*
@@ -2515,53 +2506,33 @@ static inline void unlock_task_sighand(struct task_struct *tsk,
 	spin_unlock_irqrestore(&tsk->sighand->siglock, *flags);
 }
 
-#ifdef CONFIG_CGROUPS
+/**
+ * threadgroup_change_begin - mark the beginning of changes to a threadgroup
+ * @tsk: task causing the changes
+ *
+ * All operations which modify a threadgroup - a new thread joining the
+ * group, death of a member thread (the assertion of PF_EXITING) and
+ * exec(2) dethreading the process and replacing the leader - are wrapped
+ * by threadgroup_change_{begin|end}().  This is to provide a place which
+ * subsystems needing threadgroup stability can hook into for
+ * synchronization.
+ */
 static inline void threadgroup_change_begin(struct task_struct *tsk)
 {
-	down_read(&tsk->signal->group_rwsem);
+	might_sleep();
+	cgroup_threadgroup_change_begin(tsk);
 }
+
+/**
+ * threadgroup_change_end - mark the end of changes to a threadgroup
+ * @tsk: task causing the changes
+ *
+ * See threadgroup_change_begin().
+ */
 static inline void threadgroup_change_end(struct task_struct *tsk)
 {
-	up_read(&tsk->signal->group_rwsem);
+	cgroup_threadgroup_change_end(tsk);
 }
-
-/**
- * threadgroup_lock - lock threadgroup
- * @tsk: member task of the threadgroup to lock
- *
- * Lock the threadgroup @tsk belongs to.  No new task is allowed to enter
- * and member tasks aren't allowed to exit (as indicated by PF_EXITING) or
- * change ->group_leader/pid.  This is useful for cases where the threadgroup
- * needs to stay stable across blockable operations.
- *
- * fork and exit paths explicitly call threadgroup_change_{begin|end}() for
- * synchronization.  While held, no new task will be added to threadgroup
- * and no existing live task will have its PF_EXITING set.
- *
- * de_thread() does threadgroup_change_{begin|end}() when a non-leader
- * sub-thread becomes a new leader.
- */
-static inline void threadgroup_lock(struct task_struct *tsk)
-{
-	down_write(&tsk->signal->group_rwsem);
-}
-
-/**
- * threadgroup_unlock - unlock threadgroup
- * @tsk: member task of the threadgroup to unlock
- *
- * Reverse threadgroup_lock().
- */
-static inline void threadgroup_unlock(struct task_struct *tsk)
-{
-	up_write(&tsk->signal->group_rwsem);
-}
-#else
-static inline void threadgroup_change_begin(struct task_struct *tsk) {}
-static inline void threadgroup_change_end(struct task_struct *tsk) {}
-static inline void threadgroup_lock(struct task_struct *tsk) {}
-static inline void threadgroup_unlock(struct task_struct *tsk) {}
-#endif
 
 #ifndef __HAVE_THREAD_FUNCTIONS
 
