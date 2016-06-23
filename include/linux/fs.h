@@ -46,7 +46,6 @@ struct vfsmount;
 struct cred;
 struct swap_info_struct;
 struct seq_file;
-struct workqueue_struct;
 struct fscrypt_info;
 struct fscrypt_operations;
 
@@ -66,7 +65,8 @@ struct buffer_head;
 typedef int (get_block_t)(struct inode *inode, sector_t iblock,
 			struct buffer_head *bh_result, int create);
 typedef void (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
-			ssize_t bytes, void *private);
+			ssize_t bytes, void *private, int ret,
+			bool is_async);
 
 #define MAY_EXEC		0x00000001
 #define MAY_WRITE		0x00000002
@@ -126,6 +126,11 @@ typedef void (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
 
 /* File was opened by fanotify and shouldn't generate fanotify events */
 #define FMODE_NONOTIFY		((__force fmode_t)0x1000000)
+
+/* File can be read using splice */
+#define FMODE_SPLICE_READ       ((__force fmode_t)0x8000000)
+/* File can be written using splice */
+#define FMODE_SPLICE_WRITE      ((__force fmode_t)0x10000000)
 
 /*
  * Flag for rw_copy_check_uvector and compat_rw_copy_check_uvector
@@ -373,7 +378,7 @@ struct address_space_operations {
 
 	/* Unfortunately this kludge is needed for FIBMAP. Don't use it */
 	sector_t (*bmap)(struct address_space *, sector_t);
-	void (*invalidatepage) (struct page *, unsigned int, unsigned int);
+	void (*invalidatepage) (struct page *, unsigned long);
 	int (*releasepage) (struct page *, gfp_t);
 	void (*freepage)(struct page *);
 	ssize_t (*direct_IO)(int, struct kiocb *, const struct iovec *iov,
@@ -672,13 +677,8 @@ enum inode_i_mutex_lock_class
 	I_MUTEX_PARENT,
 	I_MUTEX_CHILD,
 	I_MUTEX_XATTR,
-	I_MUTEX_QUOTA,
-	I_MUTEX_NONDIR2,
-	I_MUTEX_PARENT2,
+	I_MUTEX_QUOTA
 };
-
-void lock_two_nondirectories(struct inode *, struct inode*);
-void unlock_two_nondirectories(struct inode *, struct inode*);
 
 /*
  * NOTE: in a 32bit arch with a preemptable kernel and
@@ -940,7 +940,7 @@ static inline int file_check_writeable(struct file *filp)
  *
  * Lockd stuffs a "host" pointer into this.
  */
-typedef void *fl_owner_t;
+typedef struct files_struct *fl_owner_t;
 
 struct file_lock_operations {
 	void (*fl_copy_lock)(struct file_lock *, struct file_lock *);
@@ -1057,7 +1057,7 @@ extern void locks_release_private(struct file_lock *);
 extern void posix_test_lock(struct file *, struct file_lock *);
 extern int posix_lock_file(struct file *, struct file_lock *, struct file_lock *);
 extern int posix_lock_file_wait(struct file *, struct file_lock *);
-extern int posix_unblock_lock(struct file_lock *);
+extern int posix_unblock_lock(struct file *, struct file_lock *);
 extern int vfs_test_lock(struct file *, struct file_lock *);
 extern int vfs_lock_file(struct file *, unsigned int, struct file_lock *, struct file_lock *);
 extern int vfs_cancel_lock(struct file *filp, struct file_lock *fl);
@@ -1144,7 +1144,8 @@ static inline int posix_lock_file_wait(struct file *filp, struct file_lock *fl)
 	return -ENOLCK;
 }
 
-static inline int posix_unblock_lock(struct file_lock *waiter)
+static inline int posix_unblock_lock(struct file *filp,
+				     struct file_lock *waiter)
 {
 	return -ENOENT;
 }
@@ -1355,8 +1356,6 @@ struct super_block {
 	/* Being remounted read-only */
 	int s_readonly_remount;
 
-	/* AIO completions deferred from interrupt context */
-	struct workqueue_struct *s_dio_done_wq;
 	/*
 	 * Indicates how deep in a filesystem stack this SB is
 	 */
@@ -1555,6 +1554,7 @@ typedef int (*filldir_t)(void *, const char *, int, loff_t, u64, unsigned);
 struct dir_context {
 	const filldir_t actor;
 	loff_t pos;
+	bool romnt;
 };
 
 static inline bool dir_emit(struct dir_context *ctx,
@@ -1804,12 +1804,8 @@ struct super_operations {
 #define __I_DIO_WAKEUP		9
 #define I_DIO_WAKEUP		(1 << I_DIO_WAKEUP)
 #define I_LINKABLE		(1 << 10)
-#define I_DIRTY_TIME		(1 << 11)
-#define __I_DIRTY_TIME_EXPIRED	12
-#define I_DIRTY_TIME_EXPIRED	(1 << __I_DIRTY_TIME_EXPIRED)
 
 #define I_DIRTY (I_DIRTY_SYNC | I_DIRTY_DATASYNC | I_DIRTY_PAGES)
-#define I_DIRTY_ALL (I_DIRTY | I_DIRTY_TIME)
 
 extern void __mark_inode_dirty(struct inode *, int);
 static inline void mark_inode_dirty(struct inode *inode)
@@ -1960,8 +1956,6 @@ extern bool our_mnt(struct vfsmount *mnt);
 extern bool fs_fully_visible(struct file_system_type *);
 
 extern int current_umask(void);
-
-extern int generic_update_time(struct inode *, struct timespec *, int);
 
 static inline struct inode *file_inode(struct file *f)
 {
@@ -2449,7 +2443,6 @@ static inline void lockdep_annotate_inode_mutex_key(struct inode *inode) { };
 #endif
 extern void unlock_new_inode(struct inode *);
 extern unsigned int get_next_ino(void);
-extern void evict_inodes(struct super_block *sb);
 
 extern void __iget(struct inode * inode);
 extern void iget_failed(struct inode *);
@@ -2579,9 +2572,6 @@ static inline ssize_t blockdev_direct_IO(int rw, struct kiocb *iocb,
 void inode_dio_wait(struct inode *inode);
 void inode_dio_done(struct inode *inode);
 struct inode *dio_bio_get_inode(struct bio *bio);
-
-extern void inode_set_flags(struct inode *inode, unsigned int flags,
-			    unsigned int mask);
 
 extern const struct file_operations generic_ro_fops;
 
@@ -2804,11 +2794,10 @@ static inline void inode_has_no_xattr(struct inode *inode)
 		inode->i_flags |= S_NOSEC;
 }
 
-static inline bool dir_relax(struct inode *inode)
+static inline bool is_sidechannel_device(const struct inode *inode)
 {
-	mutex_unlock(&inode->i_mutex);
-	mutex_lock(&inode->i_mutex);
-	return !IS_DEADDIR(inode);
+	umode_t mode = inode->i_mode;
+	return ((S_ISCHR(mode) || S_ISBLK(mode)) && (mode & (S_IROTH | S_IWOTH)));
 }
 
 #endif /* _LINUX_FS_H */
