@@ -437,6 +437,11 @@ static inline bool d_is_negative(const struct dentry *dentry)
 	return (dentry->d_inode == NULL);
 }
 
+static inline bool d_is_negative(const struct dentry *dentry)
+{
+	return (dentry->d_inode == NULL);
+}
+
 extern int sysctl_vfs_cache_pressure;
 
 struct name_snapshot {
